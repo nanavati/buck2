@@ -11,6 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 import shlex
+import sqlite3
+import time
 import typing
 from pathlib import Path
 from typing import Any
@@ -688,6 +690,212 @@ async def test_dep_file_persistence_disabled_without_materializer_state(
     kinds = await _execution_kinds(buck)
     assert ACTION_EXECUTION_KIND_LOCAL_ACTION_CACHE not in kinds, kinds
     assert ACTION_EXECUTION_KIND_LOCAL in kinds, kinds
+
+
+def _dep_file_db_path(buck: Buck) -> Path:
+    return buck.cwd / "buck-out" / "v2" / "cache" / "dep_file_state" / "db.sqlite"
+
+
+def _set_dep_file_last_access_times(buck: Buck, when: int) -> int:
+    """
+    Backdate (or forward-date) every persisted entry's last-access time, as if the daemon had last
+    served or executed it at `when` (unix seconds). Returns how many entries there were. Only
+    meaningful with the daemon stopped: the daemon owns the db while it runs.
+    """
+    conn = sqlite3.connect(_dep_file_db_path(buck))
+    try:
+        updated = conn.execute(
+            "UPDATE dep_file_state SET last_access_time = ?", (when,)
+        ).rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    return updated
+
+
+def _dep_file_last_access_times(buck: Buck) -> list[int]:
+    conn = sqlite3.connect(_dep_file_db_path(buck))
+    try:
+        return [
+            row[0]
+            for row in conn.execute("SELECT last_access_time FROM dep_file_state")
+        ]
+    finally:
+        conn.close()
+
+
+_PERSISTED_DUMMY_CONFIG_ARGS = [
+    "app:app_with_dummy_config",
+    "--local-only",
+    "--no-remote-cache",
+    "-c",
+    "test.dummy_config=dummy1",
+]
+
+
+async def _build_persisted_entries_last_accessed_days_ago(
+    buck: Buck, args: list[str], days_ago: int
+) -> int:
+    """
+    Build `args` so its entries are persisted, stop the daemon, and backdate every entry's
+    last-access time by `days_ago`. Returns how many entries there are.
+    """
+    await buck.build(*args)
+    await buck.kill()
+    when = int(time.time()) - days_ago * 24 * 60 * 60
+    entries = _set_dep_file_last_access_times(buck, when)
+    assert entries > 0, "nothing was persisted"
+    return entries
+
+
+def _assert_all_accessed_recently(times: list[int]) -> None:
+    before = int(time.time()) - 10 * 60
+    assert times, "no persisted entries"
+    assert all(t >= before for t in times), (times, before)
+
+
+# Persisted entries are pruned at daemon start once they pass `sqlite_dep_file_state_ttl_days`,
+# measured from when they were last *accessed*: a reloaded entry that is served refreshes its time,
+# so an entry that keeps hitting is never aged out, however long ago it executed. The persisted
+# store is flushed at the end of every command, so the refresh is on disk by the time the build
+# returns.
+@buck_test(
+    setup_eden=False,
+    data_dir="dep_files",
+    skip_for_os=["windows"],
+    extra_buck_config={
+        "buck2": {
+            "sqlite_dep_file_state": "true",
+            "sqlite_dep_file_state_ttl_days": "30",
+        }
+    },
+)
+async def test_persisted_dep_file_hit_refreshes_last_access_time(buck: Buck) -> None:
+    args = _PERSISTED_DUMMY_CONFIG_ARGS
+    # Last accessed 20 days ago: inside the 30-day TTL, so the entries survive the prune at the
+    # next daemon start and can be served.
+    await _build_persisted_entries_last_accessed_days_ago(buck, args, days_ago=20)
+
+    await buck.build(*args)
+    kinds = await _execution_kinds(buck)
+    assert ACTION_EXECUTION_KIND_LOCAL_ACTION_CACHE in kinds, kinds
+    await buck.kill()
+
+    # Serving the entries moved their last-access time to now.
+    _assert_all_accessed_recently(_dep_file_last_access_times(buck))
+
+
+# The control for the test above: an entry that was not accessed within the TTL is pruned at
+# daemon start, so the action re-executes and re-populates the entry with a fresh time.
+@buck_test(
+    setup_eden=False,
+    data_dir="dep_files",
+    skip_for_os=["windows"],
+    extra_buck_config={
+        "buck2": {
+            "sqlite_dep_file_state": "true",
+            "sqlite_dep_file_state_ttl_days": "30",
+        }
+    },
+)
+async def test_persisted_dep_file_entry_unused_past_ttl_is_pruned(buck: Buck) -> None:
+    args = _PERSISTED_DUMMY_CONFIG_ARGS
+    # Last accessed 40 days ago: past the 30-day TTL.
+    await _build_persisted_entries_last_accessed_days_ago(buck, args, days_ago=40)
+
+    await buck.build(*args)
+    kinds = await _execution_kinds(buck)
+    assert ACTION_EXECUTION_KIND_LOCAL_ACTION_CACHE not in kinds, kinds
+    assert ACTION_EXECUTION_KIND_LOCAL in kinds, kinds
+    await buck.kill()
+
+    # Re-executing re-inserted the entries, stamped now.
+    _assert_all_accessed_recently(_dep_file_last_access_times(buck))
+
+
+# A persisted entry is configuration-independent, so a lookup under one configuration can be served
+# from the row another configuration wrote. The refresh goes to that row -- the lookup's own
+# configuration has none -- so the row that keeps hitting is the one kept alive.
+@buck_test(
+    setup_eden=False,
+    data_dir="dep_files",
+    skip_for_os=["windows"],
+    extra_buck_config={
+        "buck2": {
+            "sqlite_dep_file_state": "true",
+            "sqlite_dep_file_state_ttl_days": "30",
+        }
+    },
+)
+async def test_persisted_cross_configuration_hit_refreshes_the_served_row(
+    buck: Buck,
+) -> None:
+    def args(platform: str) -> list[str]:
+        return [
+            "app:simple_dep_file",
+            "--target-platforms",
+            f"root//platforms:{platform}",
+            "--local-only",
+            "--no-remote-cache",
+        ]
+
+    entries = await _build_persisted_entries_last_accessed_days_ago(
+        buck, args("platform_a"), days_ago=20
+    )
+
+    await buck.build(*args("platform_b"))
+    kinds = await _execution_kinds(buck)
+    assert ACTION_EXECUTION_KIND_LOCAL_ACTION_CACHE in kinds, kinds
+    assert ACTION_EXECUTION_KIND_LOCAL not in kinds, kinds
+    await buck.kill()
+
+    # A hit inserts nothing: the rows are still platform_a's, and serving them refreshed them.
+    times = _dep_file_last_access_times(buck)
+    assert len(times) == entries, (times, entries)
+    _assert_all_accessed_recently(times)
+
+
+# `sqlite_dep_file_state_max_entries` keeps the most recently accessed entries up to the cap, at
+# daemon start. The rest re-execute and are persisted again.
+@buck_test(
+    setup_eden=False,
+    data_dir="dep_files",
+    skip_for_os=["windows"],
+    extra_buck_config={
+        "buck2": {
+            "sqlite_dep_file_state": "true",
+            "sqlite_dep_file_state_max_entries": "1",
+        }
+    },
+)
+async def test_persisted_dep_file_entries_over_max_entries_are_pruned(
+    buck: Buck,
+) -> None:
+    args = [
+        "app:app_with_dummy_config",
+        "app:dir_output_dep_file",
+        "--local-only",
+        "--no-remote-cache",
+        "-c",
+        "test.dummy_config=dummy1",
+    ]
+    await buck.build(*args)
+    await buck.kill()
+    written = len(_dep_file_last_access_times(buck))
+    assert written >= 2, written
+
+    # Pruning runs when the daemon starts, whatever the command.
+    await buck.targets("app:app_with_dummy_config")
+    await buck.kill()
+    assert len(_dep_file_last_access_times(buck)) == 1
+
+    # The surviving entry is served; the pruned ones re-execute and are persisted again.
+    await buck.build(*args)
+    kinds = await _execution_kinds(buck)
+    assert ACTION_EXECUTION_KIND_LOCAL_ACTION_CACHE in kinds, kinds
+    assert ACTION_EXECUTION_KIND_LOCAL in kinds, kinds
+    await buck.kill()
+    assert len(_dep_file_last_access_times(buck)) == written
 
 
 # Skipping on windows: simple_dep_file's action uses symlinks, which aren't supported there.

@@ -47,7 +47,7 @@ use crate::sqlite::tables::dep_file_state_table::DepFileStateSqliteTable;
 ///
 /// If you forget to bump this version, you can fix forward by bumping the
 /// `buck2.sqlite_dep_file_state_version` buckconfig in the project root's .buckconfig.
-pub const DEP_FILE_DB_SCHEMA_VERSION: u64 = 2;
+pub const DEP_FILE_DB_SCHEMA_VERSION: u64 = 3;
 
 impl SqliteTable for DepFileStateSqliteTable {
     fn create_table(&self) -> buck2_error::Result<()> {
@@ -99,7 +99,7 @@ impl DepFileStateSqliteDb {
         io_executor: Arc<dyn BlockingExecutor>,
         reject_identity: Option<&SqliteIdentity>,
         // Bound the db at startup: drop entries older than `prune_cutoff` (unix seconds) and, if
-        // set, the oldest beyond `max_entries`. See `DepFileStateSqliteTable::prune`.
+        // set, the least recently used beyond `max_entries`. See `DepFileStateSqliteTable::prune`.
         prune_cutoff: Option<i64>,
         max_entries: Option<usize>,
     ) -> buck2_error::Result<Self> {
@@ -182,6 +182,11 @@ enum DepFileWriteOperation {
         logical_key: Vec<u8>,
         config_key: Vec<u8>,
     },
+    /// Refresh an entry's last-access time because it was served.
+    Touch {
+        logical_key: Vec<u8>,
+        config_key: Vec<u8>,
+    },
     Clear,
     /// Acknowledged once every write queued before it has been applied.
     Flush(crossbeam_channel::Sender<()>),
@@ -207,6 +212,17 @@ fn apply_write(db: &DepFileStateSqliteDb, write: DepFileWriteOperation) -> Optio
             table.delete(&logical_key, &config_key),
             "delete_from_dep_file_db",
             WriteKind::Delete,
+        ),
+        DepFileWriteOperation::Touch {
+            logical_key,
+            config_key,
+        } => (
+            // A row that is gone is not a failure: the entry was evicted, cleared or replaced after
+            // it was served (pruning runs only at daemon start, before any lookup), and the next
+            // insert stamps a fresh time anyway.
+            table.touch(&logical_key, &config_key),
+            "touch_dep_file_db",
+            WriteKind::Touch,
         ),
         DepFileWriteOperation::Clear => (table.clear(), "clear_dep_file_db", WriteKind::Clear),
         DepFileWriteOperation::Flush(ack) => {
@@ -248,8 +264,9 @@ fn report_read_failure(e: buck2_error::Error) {
 /// never fails a build (the in-memory cache remains authoritative).
 ///
 /// Writes are queued and applied on a dedicated thread rather than inline: they are issued once per
-/// locally-executed action, and running them on the action's own thread would make every write
-/// contend with concurrent lookups for the single connection mutex. Losing a queued write is
+/// locally-executed action (and once per served entry per touch interval, to keep its last-access
+/// time current), and running them on the action's own thread would make every write contend with
+/// concurrent lookups for the single connection mutex. Losing a queued write is
 /// harmless -- it costs a cache miss in a later session -- but [`DepFileStore::flush`] is called at
 /// the end of each command so a restart afterwards sees everything that command produced.
 ///
@@ -285,14 +302,16 @@ struct WriteCounters {
     duration_us: AtomicU64,
     max_us: AtomicU64,
     /// The writes that reached the database, split by what they did, so a slow insert and a slow
-    /// prune-driven delete are distinguishable. The three counts sum to the writes `duration_us`
-    /// covers; `applied` also counts `Flush`, which does no database work.
+    /// prune-driven delete are distinguishable. The per-kind counts sum to the writes
+    /// `duration_us` covers; `applied` also counts `Flush`, which does no database work.
     inserts: AtomicU64,
     insert_duration_us: AtomicU64,
     deletes: AtomicU64,
     delete_duration_us: AtomicU64,
     clears: AtomicU64,
     clear_duration_us: AtomicU64,
+    touches: AtomicU64,
+    touch_duration_us: AtomicU64,
 }
 
 /// What an applied write did. `Flush` has no variant: it touches no table.
@@ -300,6 +319,7 @@ struct WriteCounters {
 enum WriteKind {
     Insert,
     Delete,
+    Touch,
     Clear,
 }
 
@@ -313,6 +333,7 @@ impl WriteCounters {
             let (count, duration) = match kind {
                 WriteKind::Insert => (&self.inserts, &self.insert_duration_us),
                 WriteKind::Delete => (&self.deletes, &self.delete_duration_us),
+                WriteKind::Touch => (&self.touches, &self.touch_duration_us),
                 WriteKind::Clear => (&self.clears, &self.clear_duration_us),
             };
             count.fetch_add(1, Ordering::Relaxed);
@@ -469,6 +490,13 @@ impl DepFileStore for PersistedDepFileStore {
         });
     }
 
+    fn touch(&self, logical_key: Vec<u8>, config_key: Vec<u8>) {
+        self.queue(DepFileWriteOperation::Touch {
+            logical_key,
+            config_key,
+        });
+    }
+
     fn get_digests(&self, logical_key: &[u8]) -> Vec<StoredDepFileDigests> {
         let started = Instant::now();
         let result = self.get_digests_inner(logical_key);
@@ -535,6 +563,8 @@ impl DepFileStore for PersistedDepFileStore {
             delete_duration_us: self.write.delete_duration_us.load(Ordering::Relaxed),
             clears: self.write.clears.load(Ordering::Relaxed),
             clear_duration_us: self.write.clear_duration_us.load(Ordering::Relaxed),
+            touches: self.write.touches.load(Ordering::Relaxed),
+            touch_duration_us: self.write.touch_duration_us.load(Ordering::Relaxed),
         }
     }
 

@@ -258,6 +258,8 @@ impl SnapshotCollector {
             snapshot.dep_file_db_delete_duration_us = writes.delete_duration_us;
             snapshot.dep_file_db_clears = writes.clears;
             snapshot.dep_file_db_clear_duration_us = writes.clear_duration_us;
+            snapshot.dep_file_db_touches = writes.touches;
+            snapshot.dep_file_db_touch_duration_us = writes.touch_duration_us;
             snapshot.dep_file_db_write_duration_us = writes.duration_us;
             snapshot.dep_file_db_write_max_us = writes.max_us;
             let reads = store.read_stats();
@@ -1012,6 +1014,8 @@ mod dep_file_db_size_sampler_tests {
         fn insert(&self, _logical_key: Vec<u8>, _config_key: Vec<u8>, _state: StoredDepFileState) {}
 
         fn delete(&self, _logical_key: Vec<u8>, _config_key: Vec<u8>) {}
+
+        fn touch(&self, _logical_key: Vec<u8>, _config_key: Vec<u8>) {}
 
         fn get_digests(&self, _logical_key: &[u8]) -> Vec<StoredDepFileDigests> {
             Vec::new()

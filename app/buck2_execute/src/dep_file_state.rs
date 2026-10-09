@@ -114,6 +114,11 @@ pub struct DepFileWriteStats {
     pub delete_duration_us: u64,
     pub clears: u64,
     pub clear_duration_us: u64,
+    /// Last-used refreshes issued for served entries (see `DepFileStore::touch`). Counted apart
+    /// from inserts because they are the one write a warm build issues, so they are what sizes the
+    /// writer's load once nothing executes.
+    pub touches: u64,
+    pub touch_duration_us: u64,
 }
 
 /// Cumulative cost of the persisted store's reads, reported per snapshot. `MatchDepFilesEnd`
@@ -166,6 +171,11 @@ pub trait DepFileStore: Send + Sync + 'static {
     /// action's identity and no row handle: eviction mirrors a removal from the in-memory cache,
     /// which is keyed the same way, so the two stay one-for-one.
     fn delete(&self, logical_key: Vec<u8>, config_key: Vec<u8>);
+    /// Record that the entry for `(logical_key, config_key)` was served: refresh its last-access
+    /// time so that age-based pruning keeps entries that keep hitting, however long ago they
+    /// executed. Best-effort like every write, and a row that is no longer there (pruned or
+    /// replaced since the lookup) is not an error.
+    fn touch(&self, logical_key: Vec<u8>, config_key: Vec<u8>);
     /// The digests of every persisted entry for `logical_key`, one per configuration it was built
     /// under (empty on a miss or on any database error). Reads only the scalar table, so a candidate
     /// that cannot match costs nothing more than this. The in-memory cache calls this on demand for a
@@ -248,6 +258,8 @@ mod tests {
         fn insert(&self, _logical_key: Vec<u8>, _config_key: Vec<u8>, _state: StoredDepFileState) {}
 
         fn delete(&self, _logical_key: Vec<u8>, _config_key: Vec<u8>) {}
+
+        fn touch(&self, _logical_key: Vec<u8>, _config_key: Vec<u8>) {}
 
         fn get_digests(&self, _logical_key: &[u8]) -> Vec<StoredDepFileDigests> {
             Vec::new()

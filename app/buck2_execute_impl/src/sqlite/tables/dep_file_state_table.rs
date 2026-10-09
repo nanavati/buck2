@@ -449,7 +449,7 @@ impl DepFileStateSqliteTable {
                     local_worker_hash       BLOB NULL DEFAULT NULL,
                     local_worker_hash_kind  INTEGER NULL DEFAULT NULL,
                     was_produced_locally    INTEGER NOT NULL,
-                    last_write_time         INTEGER NOT NULL,
+                    last_access_time          INTEGER NOT NULL,
                     UNIQUE                  (logical_key, config_key)
                 )"
             ),
@@ -478,7 +478,7 @@ impl DepFileStateSqliteTable {
                 ) WITHOUT ROWID"
             ),
             format!(
-                "CREATE INDEX idx_{STATE_TABLE_NAME}_last_write_time ON {STATE_TABLE_NAME} (last_write_time)"
+                "CREATE INDEX idx_{STATE_TABLE_NAME}_last_access_time ON {STATE_TABLE_NAME} (last_access_time)"
             ),
         ] {
             conn.execute(&sql, [])
@@ -495,7 +495,7 @@ impl DepFileStateSqliteTable {
     ) -> buck2_error::Result<()> {
         static STATE_SQL: LazyLock<String> = LazyLock::new(|| {
             format!(
-                "INSERT INTO {STATE_TABLE_NAME} (logical_key, config_key, cli_digest, directory_size, directory_hash, directory_hash_kind, local_worker_size, local_worker_hash, local_worker_hash_kind, was_produced_locally, last_write_time) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+                "INSERT INTO {STATE_TABLE_NAME} (logical_key, config_key, cli_digest, directory_size, directory_hash, directory_hash_kind, local_worker_size, local_worker_hash, local_worker_hash_kind, was_produced_locally, last_access_time) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
             )
         });
         static OUTPUT_SQL: LazyLock<String> = LazyLock::new(|| {
@@ -515,8 +515,9 @@ impl DepFileStateSqliteTable {
             .local_worker_directory_digest
             .as_ref()
             .map(tracked_digest_parts);
-        // Stamped on write (re-stamped every rebuild); `prune` uses it to bound the db by age.
-        let last_write_time = jiff::Timestamp::now().as_second();
+        // Stamped on write (re-stamped every rebuild) and refreshed by `touch` whenever the entry
+        // is served; `prune` uses it to bound the db by age of last use.
+        let last_access_time = jiff::Timestamp::now().as_second();
 
         let mut conn = self.shared_connection.lock();
         let tx = conn.transaction()?;
@@ -542,7 +543,7 @@ impl DepFileStateSqliteTable {
                 local_worker.map(|(_, bytes, _)| bytes),
                 local_worker.map(|(_, _, kind)| kind),
                 state.was_produced_locally,
-                last_write_time,
+                last_access_time,
             ])
             .with_buck_error_context(|| format!("inserting into {STATE_TABLE_NAME}"))?;
         let entry_id = tx.last_insert_rowid();
@@ -681,13 +682,32 @@ impl DepFileStateSqliteTable {
         Ok(())
     }
 
-    /// Bound the db so it does not grow without limit across daemon sessions. Drops entries at or
-    /// before `cutoff` (age-based TTL, unix seconds) and -- if `max_entries` is set and exceeded --
-    /// the oldest entries beyond that count. Both bounds reduce to "drop everything written at or
-    /// before some timestamp", so their union is a single threshold (the more recent of the two) and
-    /// the whole prune is a single indexed range. Only the parent carries `last_write_time`, so the
-    /// children are deleted through the ids it selects -- and before it, or they would be orphaned.
-    /// Intended to run once at startup. Returns the number of entries pruned.
+    /// Refresh the last-access time of `(logical_key, config_key)` to now, because the entry was
+    /// just served. A row that is no longer there is not an error: the entry can have been evicted
+    /// or replaced between the lookup that served it and this write.
+    pub(crate) fn touch(&self, logical_key: &[u8], config_key: &[u8]) -> buck2_error::Result<()> {
+        static SQL: LazyLock<String> = LazyLock::new(|| {
+            format!(
+                "UPDATE {STATE_TABLE_NAME} SET last_access_time = ?1 WHERE logical_key = ?2 AND config_key = ?3"
+            )
+        });
+        let now = jiff::Timestamp::now().as_second();
+        let conn = self.shared_connection.lock();
+        conn.prepare_cached(&SQL)?
+            .execute(rusqlite::params![now, logical_key, config_key])
+            .with_buck_error_context(|| format!("touching {STATE_TABLE_NAME}"))?;
+        Ok(())
+    }
+
+    /// Bound the db so it does not grow without limit across daemon sessions. Drops entries last
+    /// used at or before `cutoff` (age-based TTL, unix seconds) and -- if `max_entries` is set and
+    /// exceeded -- the least recently used entries beyond that count. "Used" is the later of an
+    /// entry's last execution and its last hit (`touch`), so an entry that keeps being served is
+    /// never pruned however long ago it ran. The count cap is applied by rank, not by converting it
+    /// to a timestamp, so it removes exactly the overflow: entries written within the same second
+    /// no longer all go together. Only the parent carries `last_access_time`, so the children are
+    /// deleted through the ids it selects -- and before it, or they would be orphaned. Intended to
+    /// run once at startup. Returns the number of entries pruned.
     pub(crate) fn prune(
         &self,
         cutoff: Option<i64>,
@@ -695,45 +715,51 @@ impl DepFileStateSqliteTable {
     ) -> buck2_error::Result<usize> {
         let mut conn = self.shared_connection.lock();
         let tx = conn.transaction()?;
+        let mut pruned = 0;
 
-        // The count cap reduces to a timestamp: the `(max_entries + 1)`-th most-recently-written
-        // entry is the newest one to drop. `OFFSET` past the end returns no row (nothing over the
-        // cap). Coarse second-granularity ties make this a soft bound, which is fine for a growth cap.
-        let max_entries_cutoff: Option<i64> = match max_entries {
-            Some(max_entries) => tx
-                .query_row(
+        if let Some(cutoff) = cutoff {
+            for table in [OUTPUTS_TABLE_NAME, DECLARED_TABLE_NAME] {
+                tx.execute(
                     &format!(
-                        "SELECT last_write_time FROM {STATE_TABLE_NAME} ORDER BY last_write_time DESC LIMIT 1 OFFSET ?1"
+                        "DELETE FROM {table} WHERE entry_id IN (SELECT id FROM {STATE_TABLE_NAME} WHERE last_access_time <= ?1)"
+                    ),
+                    rusqlite::params![cutoff],
+                )
+                .with_buck_error_context(|| format!("pruning {table} by age"))?;
+            }
+            pruned += tx
+                .execute(
+                    &format!("DELETE FROM {STATE_TABLE_NAME} WHERE last_access_time <= ?1"),
+                    rusqlite::params![cutoff],
+                )
+                .with_buck_error_context(|| format!("pruning {STATE_TABLE_NAME} by age"))?;
+        }
+
+        if let Some(max_entries) = max_entries {
+            // The rows ranked past the cap, most recently used first; `id` breaks ties so the
+            // ranking is total and the children's and the parent's subqueries agree on it. `LIMIT
+            // -1` is SQLite's "no limit", which `OFFSET` needs; an offset past the end selects
+            // nothing (nothing over the cap). The children's subquery sees the same rows as the
+            // parent's because the parent is deleted last, within the same transaction.
+            for table in [OUTPUTS_TABLE_NAME, DECLARED_TABLE_NAME] {
+                tx.execute(
+                    &format!(
+                        "DELETE FROM {table} WHERE entry_id IN (SELECT id FROM {STATE_TABLE_NAME} ORDER BY last_access_time DESC, id DESC LIMIT -1 OFFSET ?1)"
                     ),
                     rusqlite::params![max_entries],
-                    |row| row.get(0),
                 )
-                .optional()
-                .with_buck_error_context(|| {
-                    format!("reading {STATE_TABLE_NAME} max-entries cutoff for prune")
-                })?,
-            None => None,
-        };
-
-        let Some(cutoff) = [cutoff, max_entries_cutoff].into_iter().flatten().max() else {
-            return Ok(0);
-        };
-
-        for table in [OUTPUTS_TABLE_NAME, DECLARED_TABLE_NAME] {
-            tx.execute(
-                &format!(
-                    "DELETE FROM {table} WHERE entry_id IN (SELECT id FROM {STATE_TABLE_NAME} WHERE last_write_time <= ?1)"
-                ),
-                rusqlite::params![cutoff],
-            )
-            .with_buck_error_context(|| format!("pruning {table}"))?;
+                .with_buck_error_context(|| format!("pruning {table} by count"))?;
+            }
+            pruned += tx
+                .execute(
+                    &format!(
+                        "DELETE FROM {STATE_TABLE_NAME} WHERE id IN (SELECT id FROM {STATE_TABLE_NAME} ORDER BY last_access_time DESC, id DESC LIMIT -1 OFFSET ?1)"
+                    ),
+                    rusqlite::params![max_entries],
+                )
+                .with_buck_error_context(|| format!("pruning {STATE_TABLE_NAME} by count"))?;
         }
-        let pruned = tx
-            .execute(
-                &format!("DELETE FROM {STATE_TABLE_NAME} WHERE last_write_time <= ?1"),
-                rusqlite::params![cutoff],
-            )
-            .with_buck_error_context(|| format!("pruning {STATE_TABLE_NAME}"))?;
+
         tx.commit()?;
         Ok(pruned)
     }
@@ -1007,17 +1033,32 @@ mod tests {
         }
     }
 
-    fn set_write_time(table: &DepFileStateSqliteTable, logical: &[u8], config: &[u8], t: i64) {
+    fn set_access_time(table: &DepFileStateSqliteTable, logical: &[u8], config: &[u8], t: i64) {
         table
             .shared_connection
             .lock()
             .execute(
                 &format!(
-                    "UPDATE {STATE_TABLE_NAME} SET last_write_time = ?1 WHERE logical_key = ?2 AND config_key = ?3"
+                    "UPDATE {STATE_TABLE_NAME} SET last_access_time = ?1 WHERE logical_key = ?2 AND config_key = ?3"
                 ),
                 rusqlite::params![t, logical, config],
             )
             .unwrap();
+    }
+
+    fn access_time(table: &DepFileStateSqliteTable, logical: &[u8], config: &[u8]) -> Option<i64> {
+        table
+            .shared_connection
+            .lock()
+            .query_row(
+                &format!(
+                    "SELECT last_access_time FROM {STATE_TABLE_NAME} WHERE logical_key = ?1 AND config_key = ?2"
+                ),
+                rusqlite::params![logical, config],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
     }
 
     /// For testing only: Probe for `(logical, config)` the way production does, then fetch by the
@@ -1093,11 +1134,11 @@ mod tests {
         for k in [b"a", b"b", b"c"] {
             table.insert(k.to_vec(), b"cfg".to_vec(), make())?;
         }
-        set_write_time(&table, b"a", b"cfg", 100);
-        set_write_time(&table, b"b", b"cfg", 200);
-        set_write_time(&table, b"c", b"cfg", 300);
+        set_access_time(&table, b"a", b"cfg", 100);
+        set_access_time(&table, b"b", b"cfg", 200);
+        set_access_time(&table, b"c", b"cfg", 300);
 
-        // TTL: drop entries with last_write_time < 150 -> only "a".
+        // TTL: drop entries with last_access_time < 150 -> only "a".
         assert_eq!(table.prune(Some(150), None)?, 1);
         assert!(probe_then_read(&table, b"a", b"cfg", digest_config)?.is_none());
         assert!(probe_then_read(&table, b"b", b"cfg", digest_config)?.is_some());
@@ -1105,10 +1146,110 @@ mod tests {
         // Prune reaches children through the parent, so it must not leave any behind.
         assert_eq!(orphan_row_count(&table), 0);
 
-        // max_entries: keep only the most-recently-written ("c").
+        // max_entries: keep only the most-recently-used ("c").
         assert_eq!(table.prune(None, Some(1))?, 1);
         assert!(probe_then_read(&table, b"b", b"cfg", digest_config)?.is_none());
         assert!(probe_then_read(&table, b"c", b"cfg", digest_config)?.is_some());
+        assert_eq!(orphan_row_count(&table), 0);
+
+        // Neither bound: nothing to do.
+        assert_eq!(table.prune(None, None)?, 0);
+        assert!(probe_then_read(&table, b"c", b"cfg", digest_config)?.is_some());
+        Ok(())
+    }
+
+    /// The count cap removes exactly the overflow, least recently used first, even when every
+    /// entry was used within the same second: it ranks the rows rather than converting the cap
+    /// into a timestamp threshold, which would delete every entry sharing the cutoff second.
+    #[test]
+    fn test_prune_max_entries_is_by_rank_not_by_timestamp() -> buck2_error::Result<()> {
+        let digest_config = DigestConfig::testing_default();
+        let table = table();
+        let directory_digest =
+            TrackedFileDigest::from_content(b"d", digest_config.cas_digest_config())
+                .data()
+                .dupe();
+        let make = || StoredDepFileState {
+            cli_digest: vec![1u8; 32],
+            directory_digest: directory_digest.dupe(),
+            local_worker_directory_digest: None,
+            was_produced_locally: true,
+            declared: vec![],
+            outputs: vec![leaf_output("o", file_value(digest_config, b"c", false))],
+        };
+        for k in [b"a", b"b", b"c", b"d"] {
+            table.insert(k.to_vec(), b"cfg".to_vec(), make())?;
+        }
+        // Three entries tie on the second; "d" is older.
+        for k in [b"a", b"b", b"c"] {
+            set_access_time(&table, k, b"cfg", 500);
+        }
+        set_access_time(&table, b"d", b"cfg", 400);
+
+        // Cap of 2 over 4 entries: exactly 2 go, the oldest ("d") and one of the tied three.
+        assert_eq!(table.prune(None, Some(2))?, 2);
+        assert!(probe_then_read(&table, b"d", b"cfg", digest_config)?.is_none());
+        let survivors = [b"a", b"b", b"c"]
+            .iter()
+            .filter(|k| {
+                probe_then_read(&table, k.as_slice(), b"cfg", digest_config)
+                    .unwrap()
+                    .is_some()
+            })
+            .count();
+        assert_eq!(survivors, 2);
+        assert_eq!(orphan_row_count(&table), 0);
+
+        // At or under the cap: nothing goes.
+        assert_eq!(table.prune(None, Some(2))?, 0);
+        assert_eq!(table.prune(None, Some(10))?, 0);
+        Ok(())
+    }
+
+    /// A served entry is touched, which moves its last-access time to now, so the TTL spares an
+    /// entry that keeps hitting however long ago it executed. Touching a row that is gone is not
+    /// an error and changes nothing.
+    #[test]
+    fn test_touch_refreshes_last_access_time_and_the_ttl_spares_it() -> buck2_error::Result<()> {
+        let digest_config = DigestConfig::testing_default();
+        let table = table();
+        let directory_digest =
+            TrackedFileDigest::from_content(b"d", digest_config.cas_digest_config())
+                .data()
+                .dupe();
+        let make = || StoredDepFileState {
+            cli_digest: vec![1u8; 32],
+            directory_digest: directory_digest.dupe(),
+            local_worker_directory_digest: None,
+            was_produced_locally: true,
+            declared: vec![],
+            outputs: vec![leaf_output("o", file_value(digest_config, b"c", false))],
+        };
+        table.insert(b"hot".to_vec(), b"cfg".to_vec(), make())?;
+        table.insert(b"cold".to_vec(), b"cfg".to_vec(), make())?;
+        // Both executed long ago.
+        set_access_time(&table, b"hot", b"cfg", 100);
+        set_access_time(&table, b"cold", b"cfg", 100);
+
+        // Serving "hot" refreshes it to now; the other row is untouched.
+        table.touch(b"hot", b"cfg")?;
+        let now = jiff::Timestamp::now().as_second();
+        let refreshed = access_time(&table, b"hot", b"cfg").unwrap();
+        assert!(
+            refreshed >= now - 60 && refreshed <= now + 60,
+            "{refreshed} vs {now}"
+        );
+        assert_eq!(access_time(&table, b"cold", b"cfg"), Some(100));
+        table.touch(b"hot", b"other-cfg")?;
+        table.touch(b"absent", b"cfg")?;
+        assert_eq!(access_time(&table, b"hot", b"other-cfg"), None);
+        assert_eq!(access_time(&table, b"cold", b"cfg"), Some(100));
+
+        // A TTL cutoff after the old execution time keeps the served entry and drops the other.
+        assert_eq!(table.prune(Some(150), None)?, 1);
+        assert!(probe_then_read(&table, b"hot", b"cfg", digest_config)?.is_some());
+        assert!(probe_then_read(&table, b"cold", b"cfg", digest_config)?.is_none());
+        assert_eq!(orphan_row_count(&table), 0);
         Ok(())
     }
 
@@ -1500,9 +1641,9 @@ mod tests {
     /// real schema so a future column or index change that silently turns a lookup into a table walk
     /// fails here rather than in a profile.
     ///
-    /// Deliberately not "must not contain SCAN": `prune` resolving its max-entries cutoff is a
-    /// covering-index scan, which is the optimal plan for `ORDER BY ... LIMIT 1 OFFSET ?` and builds
-    /// no temp B-tree. What actually matters is that an index is used and nothing is sorted.
+    /// Deliberately not "must not contain SCAN": `prune` selecting the rows past its count cap is a
+    /// covering-index scan, which is the optimal plan for `ORDER BY ... LIMIT -1 OFFSET ?` and
+    /// builds no temp B-tree. What actually matters is that an index is used and nothing is sorted.
     #[test]
     fn test_production_statements_are_indexed() {
         let table = table();
@@ -1533,14 +1674,22 @@ mod tests {
                 "DELETE FROM {OUTPUTS_TABLE_NAME} WHERE entry_id = (SELECT id FROM {STATE_TABLE_NAME} WHERE logical_key = ?1 AND config_key = ?2)"
             ),
             &format!("DELETE FROM {STATE_TABLE_NAME} WHERE logical_key = ?1 AND config_key = ?2"),
-            // prune
+            // touch
             &format!(
-                "SELECT last_write_time FROM {STATE_TABLE_NAME} ORDER BY last_write_time DESC LIMIT 1 OFFSET ?1"
+                "UPDATE {STATE_TABLE_NAME} SET last_access_time = ?1 WHERE logical_key = ?2 AND config_key = ?3"
+            ),
+            // prune by age
+            &format!(
+                "DELETE FROM {OUTPUTS_TABLE_NAME} WHERE entry_id IN (SELECT id FROM {STATE_TABLE_NAME} WHERE last_access_time <= ?1)"
+            ),
+            &format!("DELETE FROM {STATE_TABLE_NAME} WHERE last_access_time <= ?1"),
+            // prune by count
+            &format!(
+                "DELETE FROM {OUTPUTS_TABLE_NAME} WHERE entry_id IN (SELECT id FROM {STATE_TABLE_NAME} ORDER BY last_access_time DESC, id DESC LIMIT -1 OFFSET ?1)"
             ),
             &format!(
-                "DELETE FROM {OUTPUTS_TABLE_NAME} WHERE entry_id IN (SELECT id FROM {STATE_TABLE_NAME} WHERE last_write_time <= ?1)"
+                "DELETE FROM {STATE_TABLE_NAME} WHERE id IN (SELECT id FROM {STATE_TABLE_NAME} ORDER BY last_access_time DESC, id DESC LIMIT -1 OFFSET ?1)"
             ),
-            &format!("DELETE FROM {STATE_TABLE_NAME} WHERE last_write_time <= ?1"),
         ] {
             let plan = plan(sql);
             assert!(

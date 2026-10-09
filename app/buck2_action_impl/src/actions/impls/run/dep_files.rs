@@ -11,6 +11,9 @@
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -352,6 +355,72 @@ fn remove_dep_file_entry(
     }
 }
 
+/// How often a served entry's persisted last-access time is refreshed. Pruning is by days
+/// (`sqlite_dep_file_state_ttl_days`), so refreshing more often than this buys nothing and would
+/// cost a write per hit: a warm build hits every action it has.
+const TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// The clock `PersistedRow::last_touched` is read on. Only differences matter, so it starts at the
+/// first use rather than at the epoch.
+static TOUCH_CLOCK: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+fn touch_clock_secs() -> u64 {
+    TOUCH_CLOCK.elapsed().as_secs()
+}
+
+/// The persisted row that backs a live entry: the one its execution wrote, or the one it was
+/// reloaded from. Serving the entry refreshes this row's last-access time (`touch_served_entry`).
+/// A reloaded entry's row can belong to another configuration than the one it is cached under,
+/// which is why the row's own keys are kept rather than re-derived from the entry's.
+#[derive(Allocative)]
+struct PersistedRow {
+    logical_key: Vec<u8>,
+    config_key: Vec<u8>,
+    /// When the row's last-access time was last refreshed, on `TOUCH_CLOCK`. Starts out as now:
+    /// the write that created the row, or the hit that reloaded it, stamped the row itself.
+    last_touched: AtomicU64,
+}
+
+impl PersistedRow {
+    fn new(logical_key: Vec<u8>, config_key: Vec<u8>) -> Self {
+        Self {
+            logical_key,
+            config_key,
+            last_touched: AtomicU64::new(touch_clock_secs()),
+        }
+    }
+}
+
+/// Refresh the last-access time of the persisted row behind `state`, which was just served, at
+/// most once per `TOUCH_INTERVAL` per entry. Without this a row's time would track only when the
+/// action last executed, and an entry that keeps hitting across restarts would be pruned once it
+/// passed the TTL. Nothing to do for an entry with no row: a store-less daemon, an action that is
+/// not persisted (anon targets, BXL, outputs with symlink dependencies), or one that was not
+/// produced locally.
+fn touch_served_entry(store: Option<&dyn DepFileStore>, state: &DepFileState) {
+    touch_served_entry_at(store, state, touch_clock_secs());
+}
+
+/// `touch_served_entry` with the clock read out, so the coalescing can be tested.
+fn touch_served_entry_at(store: Option<&dyn DepFileStore>, state: &DepFileState, now: u64) {
+    let (Some(store), Some(row)) = (store, state.persisted.as_ref()) else {
+        return;
+    };
+    let last = row.last_touched.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < TOUCH_INTERVAL.as_secs() {
+        return;
+    }
+    // Of several concurrent hits on one entry, only the one that advances the stamp writes.
+    if row
+        .last_touched
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    store.touch(row.logical_key.clone(), row.config_key.clone());
+}
+
 /// The input signatures for a DepFileState. We compute those lazily, so we either have the input
 /// directories (no computation done), or the actual signatures (computation was done).
 #[derive(Allocative)]
@@ -528,6 +597,8 @@ pub(crate) struct DepFileState {
     /// dep-file-filtered machinery; a reloaded entry carries only configuration-independent
     /// identities. See `DepFileDeclaration`.
     declared: DepFileDeclaration,
+    /// The persisted row this entry is backed by, if any. See `PersistedRow`.
+    persisted: Option<PersistedRow>,
 }
 
 #[derive(Allocative)]
@@ -1255,6 +1326,7 @@ pub(crate) async fn match_if_identical_action(
             let live = previous_state.result();
             if outputs_are_still_present_in_materializer(ctx, live).await? {
                 tracing::trace!("Dep files are a hit");
+                touch_served_entry(ctx.dep_file_store(), &previous_state);
                 stats.hit_live();
                 return Ok((Some(live.dupe()), false));
             }
@@ -1294,6 +1366,7 @@ pub(crate) async fn match_if_identical_action(
             CrossConfigProbe::NotHit => {}
             CrossConfigProbe::Hit(outputs) => {
                 tracing::trace!("Cross-configuration local action cache hit");
+                touch_served_entry(ctx.dep_file_store(), &candidate);
                 stats.hit_live();
                 return Ok((Some(outputs), false));
             }
@@ -1303,11 +1376,10 @@ pub(crate) async fn match_if_identical_action(
 
     // Nothing built this session matched. Consult the persisted store, loading just this logical
     // action's rows on demand rather than holding the whole db in memory. On a hit we promote the
-    // entry into the live `map` so subsequent same-configuration lookups take the fast path.
-    //
-    // Promotion does not write to the store, so a row's `last_write_time` tracks when the action
-    // last *executed*, not when it was last served. An action that keeps hitting this path without
-    // re-executing is therefore pruned once it passes `sqlite_dep_file_state_ttl_days`.
+    // entry into the live `map` so subsequent same-configuration lookups take the fast path, and
+    // refresh the row's last-access time, so that an entry which keeps hitting across restarts is
+    // not pruned once it passes `sqlite_dep_file_state_ttl_days` (the row is stamped on execution,
+    // and a reloaded entry has by definition not executed this session).
     if let Some(store) = ctx.dep_file_store()
         && let Some(logical_key) = encode_logical_key(&logical)
     {
@@ -1383,12 +1455,18 @@ pub(crate) async fn match_if_identical_action(
             {
                 CrossConfigProbe::NotHit => {}
                 CrossConfigProbe::Hit(outputs) => {
+                    // The row served is the one the candidate came from, which may belong to
+                    // another configuration than this lookup's. It is the row the promoted entry
+                    // keeps refreshing on later hits.
+                    let row = PersistedRow::new(logical_key.clone(), digests.config_key);
+                    store.touch(row.logical_key.clone(), row.config_key.clone());
                     promote_reloaded_entry(
                         ctx.dep_file_cache(),
                         &logical,
                         key.configuration(),
                         loaded,
                         outputs.dupe(),
+                        row,
                     );
                     tracing::trace!("Persisted local action cache hit");
                     store.note_persisted_hit();
@@ -1448,7 +1526,8 @@ async fn probe_cross_config_candidate(
 }
 
 /// Promote an entry reloaded from the persisted store into the live `map` under `cfg`, so later
-/// same-configuration lookups take the fast path without re-querying the store.
+/// same-configuration lookups take the fast path without re-querying the store. `row` is the
+/// persisted row the entry came from, which its hits refresh.
 ///
 /// The reloaded `declared` (its config-independent identities) is carried over unchanged so
 /// `check_action` still matches the identical action on the fast path. A reloaded entry has no live
@@ -1461,6 +1540,7 @@ fn promote_reloaded_entry(
     cfg: Option<Configuration>,
     loaded: LoadedEntry,
     outputs: ActionOutputs,
+    row: PersistedRow,
 ) {
     let promoted = DepFileState {
         // `check_action` confirmed these equal the live action's digests.
@@ -1468,6 +1548,7 @@ fn promote_reloaded_entry(
         result: outputs,
         was_produced_locally: loaded.was_produced_locally,
         declared: loaded.declared,
+        persisted: Some(row),
     };
     // The insert is unconditional: DICE evaluates an action key once and shares the result, so no
     // concurrent execution of this `(logical, cfg)` can have filled the slot with a `Live` entry
@@ -1687,6 +1768,7 @@ pub(crate) async fn match_or_clear_dep_file(
         .await?
     {
         tracing::trace!("Dep files are a hit");
+        touch_served_entry(ctx.dep_file_store(), &previous_state);
         return Ok(Some(outputs));
     }
 
@@ -2081,12 +2163,14 @@ pub(crate) async fn populate_dep_files(
 
     let result = result.dupe();
 
-    let state = if declared_dep_files.is_empty() {
+    // `persisted` is filled in below, once the entry's row has actually been queued for writing.
+    let mut state = if declared_dep_files.is_empty() {
         DepFileState {
             digests,
             result,
             was_produced_locally,
             declared: DepFileDeclaration::None,
+            persisted: None,
         }
     } else {
         let input_signatures = match filtered_input_fingerprints {
@@ -2121,6 +2205,7 @@ pub(crate) async fn populate_dep_files(
                 declared_dep_files,
                 input_signatures: Mutex::new(input_signatures),
             },
+            persisted: None,
         }
     };
 
@@ -2141,8 +2226,11 @@ pub(crate) async fn populate_dep_files(
         // cache miss in a later session and must not fail this build.
         match state.to_stored() {
             Ok(Some(stored)) => {
-                store.insert(logical_key, encode_config_key(cfg.dupe()), stored);
+                let config_key = encode_config_key(cfg.dupe());
+                store.insert(logical_key.clone(), config_key.clone(), stored);
                 queued_write = true;
+                // The insert stamps the row's last-access time, so the entry starts out touched.
+                state.persisted = Some(PersistedRow::new(logical_key, config_key));
             }
             Ok(None) => {}
             Err(e) => tracing::debug!("Not persisting dep-file entry: {}", e),
@@ -2154,7 +2242,8 @@ pub(crate) async fn populate_dep_files(
     // persist above, the previous row is left in place; a lookup re-validates it against the
     // action's digests and the materializer before serving it. Rows this version writes are
     // deps-free, but nothing in the schema enforces that, so the re-validation is what makes
-    // leaving the row safe.
+    // leaving the row safe. Such an entry has no `persisted` row, so its hits do not refresh the
+    // previous row either: only a row known to hold this entry is kept alive by serving it.
     dep_files(ctx.dep_file_cache()).insert(logical.dupe(), cfg, Arc::new(state));
     Ok(queued_write)
 }
@@ -2999,7 +3088,74 @@ mod tests {
             result,
             was_produced_locally: true,
             declared: DepFileDeclaration::None,
+            persisted: None,
         }
+    }
+
+    /// A store that records its touches and does nothing else.
+    #[derive(Default)]
+    struct TouchRecorder {
+        touches: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
+    }
+
+    impl DepFileStore for TouchRecorder {
+        fn insert(&self, _logical_key: Vec<u8>, _config_key: Vec<u8>, _state: StoredDepFileState) {}
+
+        fn delete(&self, _logical_key: Vec<u8>, _config_key: Vec<u8>) {}
+
+        fn touch(&self, logical_key: Vec<u8>, config_key: Vec<u8>) {
+            self.touches.lock().push((logical_key, config_key));
+        }
+
+        fn get_digests(&self, _logical_key: &[u8]) -> Vec<StoredDepFileDigests> {
+            Vec::new()
+        }
+
+        fn get_entry(&self, _id: i64) -> Option<StoredDepFileState> {
+            None
+        }
+
+        fn clear(&self) {}
+    }
+
+    /// A served entry refreshes the row it is backed by at most once per `TOUCH_INTERVAL`, and an
+    /// entry without a row never does.
+    #[test]
+    fn test_touch_served_entry_coalesces_per_interval() {
+        let store = TouchRecorder::default();
+        let interval = TOUCH_INTERVAL.as_secs();
+        let mut state = dep_file_state_with(
+            ActionOutputs::new(BuckIndexMap::new()),
+            DigestConfig::testing_default(),
+        );
+
+        // No row behind it: nothing to refresh, however long ago.
+        touch_served_entry_at(Some(&store), &state, 10 * interval);
+        assert!(store.touches.lock().is_empty());
+
+        state.persisted = Some(PersistedRow {
+            logical_key: b"logical".to_vec(),
+            config_key: b"cfg".to_vec(),
+            last_touched: AtomicU64::new(0),
+        });
+        // Within the interval of the stamp the row came with: nothing to do.
+        touch_served_entry_at(Some(&store), &state, 0);
+        touch_served_entry_at(Some(&store), &state, interval - 1);
+        assert!(store.touches.lock().is_empty());
+        // The interval has passed: one write, keyed by the row, and the stamp advances so the hits
+        // that follow within the next interval write nothing.
+        touch_served_entry_at(Some(&store), &state, interval);
+        touch_served_entry_at(Some(&store), &state, interval);
+        touch_served_entry_at(Some(&store), &state, 2 * interval - 1);
+        assert_eq!(
+            *store.touches.lock(),
+            vec![(b"logical".to_vec(), b"cfg".to_vec())]
+        );
+        touch_served_entry_at(Some(&store), &state, 2 * interval);
+        assert_eq!(store.touches.lock().len(), 2);
+        // No store (persistence off): nothing to write to.
+        touch_served_entry_at(None, &state, 10 * interval);
+        assert_eq!(store.touches.lock().len(), 2);
     }
 
     #[test]

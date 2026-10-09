@@ -253,8 +253,10 @@ pub(crate) async fn maybe_initialize_dep_file_sqlite_db(
         daemon_id,
     )?;
 
-    // Bound the db across sessions. TTL (0 disables age-based pruning) mirrors the materializer's
-    // default `clean_stale_artifact_ttl_hours`; `max_entries` is an optional hard cap.
+    // Bound the db across sessions by time since each entry was last used (executed or served; 0
+    // disables age-based pruning), mirroring the materializer's default
+    // `clean_stale_artifact_ttl_hours`; `max_entries` is an optional hard cap on the count, applied
+    // least recently used first.
     let ttl_days: u64 = root_config
         .parse(BuckconfigKeyRef {
             section: "buck2",

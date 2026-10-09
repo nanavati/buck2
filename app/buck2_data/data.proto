@@ -1323,6 +1323,10 @@ message Snapshot {
   uint64 dep_file_db_delete_duration_us = 462;
   uint64 dep_file_db_clears = 463;
   uint64 dep_file_db_clear_duration_us = 464;
+  // Last-used refreshes for served entries. The one write a warm build issues,
+  // so this is what sizes the writer's load once nothing executes.
+  uint64 dep_file_db_touches = 472;
+  uint64 dep_file_db_touch_duration_us = 473;
   // Entries actually served from disk: the row survived re-validation and its
   // outputs were still materialized. Strictly fewer than `fetches_found`, which
   // only says the row existed.
@@ -2244,7 +2248,9 @@ message ActionExecutionEnd {
 
   // Dep-file cache entries this action queued for persisting. At most one, but
   // carried as a count so summing it across a command's actions gives the
-  // command's total.
+  // command's total. Only the entry's insert counts: the refresh of a served
+  // entry's last-access time is not attributed to an action (see
+  // `Snapshot.dep_file_db_touches`).
   optional uint64 dep_file_db_writes_queued = 47;
 }
 
@@ -3474,7 +3480,9 @@ message InvocationRecord {
   optional uint64 dep_file_db_hits = 757;
   // Entries this command queued for persisting. Writes are applied off-thread
   // and can outlive the command, so what they cost is a daemon-level figure and
-  // lives on `Snapshot`; only the queuing belongs to a command.
+  // lives on `Snapshot`; only the queuing belongs to a command. Inserts only:
+  // the refreshes of served entries' last-access times are not attributed to a
+  // command either (see `Snapshot.dep_file_db_touches`).
   optional uint64 dep_file_db_writes_queued = 758;
   // Names of the RE quotas that throttled this command's actions.
   repeated string re_exceeded_quotas = 761;
